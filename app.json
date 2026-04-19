@@ -1,11 +1,11 @@
 {
   "expo": {
-    "name": "imu-expo-json",
+    "name": "IMU JSON Host",
     "slug": "imu-expo-json",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "dark",
     "newArchEnabled": true,
     "splash": {
       "image": "./assets/splash-icon.png",
@@ -21,6 +21,9 @@
         "backgroundColor": "#ffffff"
       },
       "edgeToEdgeEnabled": true,
+      "permissions": [
+        "HIGH_SAMPLING_RATE_SENSORS"
+      ],
       "predictiveBackGestureEnabled": false
     },
     "web": {
