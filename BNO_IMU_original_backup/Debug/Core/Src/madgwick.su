@@ -1,0 +1,4 @@
+../Core/Src/madgwick.c:19:14:invSqrt	16	static
+../Core/Src/madgwick.c:23:6:Madgwick_init	24	static
+../Core/Src/madgwick.c:32:6:Madgwick_update	256	static
+../Core/Src/madgwick.c:189:6:Madgwick_getEuler	64	static

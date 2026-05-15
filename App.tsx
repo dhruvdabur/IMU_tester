@@ -63,9 +63,10 @@ type SensorKey = 'accelerometer' | 'gyroscope' | 'magnetometer';
 type SamplePoint = { t: number; x: number | null; y: number | null; z: number | null };
 
 const DEFAULT_SERVER = 'http://172.20.10.4:65000';
-const DEFAULT_RATE_HZ = 50;
-const MAX_RATE_HZ = 200;
-const UI_UPDATE_MS = 100;
+const DEFAULT_RATE_HZ = 20;
+const MAX_RATE_HZ = 60;
+const UI_UPDATE_MS = 1000;
+const POST_STATUS_UPDATE_MS = 1000;
 const HISTORY_LIMIT = 140;
 const VECTOR_DECIMALS = 6;
 const EULER_DECIMALS = 4;
@@ -224,6 +225,14 @@ function buildPayload(
   const roll = -devicePitch;
   const pitch = deviceRoll;
   const yaw = -deviceYaw;
+  const gyroscopeVector = gyroscope
+    ? vectorFromMeasurement(gyroscope)
+    : {
+        x: round(motion?.rotationRate?.alpha == null ? null : degToRad(motion.rotationRate.alpha)),
+        y: round(motion?.rotationRate?.beta == null ? null : degToRad(motion.rotationRate.beta)),
+        z: round(motion?.rotationRate?.gamma == null ? null : degToRad(motion.rotationRate.gamma)),
+        timestamp: motion?.rotationRate?.timestamp ?? null,
+      };
 
   return {
     version: 1,
@@ -249,7 +258,7 @@ function buildPayload(
       units: 'm/s^2',
     },
     gyroscope: {
-      ...vectorFromMeasurement(gyroscope),
+      ...gyroscopeVector,
       units: 'rad/s',
     },
     rotationRate: {
@@ -297,6 +306,58 @@ function toCsv(payload: ImuPayload) {
   ].join(',');
 }
 
+function motionEuler(motion: DeviceMotionMeasurement | null) {
+  const deviceRoll = round(radToDeg(motion?.rotation?.gamma ?? 0), EULER_DECIMALS) ?? 0;
+  const devicePitch = round(radToDeg(motion?.rotation?.beta ?? 0), EULER_DECIMALS) ?? 0;
+  const deviceYaw = round(radToDeg(motion?.rotation?.alpha ?? 0), EULER_DECIMALS) ?? 0;
+
+  return {
+    roll: -devicePitch,
+    pitch: deviceRoll,
+    yaw: -deviceYaw,
+  };
+}
+
+function buildCsvPacket(
+  motion: DeviceMotionMeasurement | null,
+  accelerometer: AccelerometerMeasurement | null,
+  gyroscope: GyroscopeMeasurement | null,
+  magnetometer: MagnetometerMeasurement | null
+) {
+  const euler = motionEuler(motion);
+  const quat = quaternionFromEuler(euler.roll, euler.pitch, euler.yaw);
+  const accel = vectorFromDeviceMotion(motion?.acceleration);
+  const fallbackAccel = vectorFromMeasurement(accelerometer);
+  const gyro = gyroscope
+    ? vectorFromMeasurement(gyroscope)
+    : {
+        x: round(motion?.rotationRate?.alpha == null ? null : degToRad(motion.rotationRate.alpha)),
+        y: round(motion?.rotationRate?.beta == null ? null : degToRad(motion.rotationRate.beta)),
+        z: round(motion?.rotationRate?.gamma == null ? null : degToRad(motion.rotationRate.gamma)),
+      };
+  const mag = vectorFromMeasurement(magnetometer);
+
+  return [
+    Date.now(),
+    accel.x ?? fallbackAccel.x ?? 0,
+    accel.y ?? fallbackAccel.y ?? 0,
+    accel.z ?? fallbackAccel.z ?? 0,
+    gyro.x ?? 0,
+    gyro.y ?? 0,
+    gyro.z ?? 0,
+    mag.x ?? 0,
+    mag.y ?? 0,
+    mag.z ?? 0,
+    quat.w,
+    quat.x,
+    quat.y,
+    quat.z,
+    euler.yaw,
+    euler.pitch,
+    euler.roll,
+  ].join(',');
+}
+
 function magnitude(vector: Vector3) {
   const values = [vector.x, vector.y, vector.z].filter((value): value is number => typeof value === 'number');
   if (values.length !== 3) {
@@ -331,10 +392,10 @@ function appendHistory(history: Record<SensorKey, SamplePoint[]>, payload: ImuPa
 }
 
 export default function App() {
-  const [tab, setTab] = useState<TabKey>('dashboard');
+  const [tab, setTab] = useState<TabKey>('stream');
   const [server, setServer] = useState(DEFAULT_SERVER);
   const [rateHzText, setRateHzText] = useState(String(DEFAULT_RATE_HZ));
-  const [format, setFormat] = useState<StreamFormat>('json');
+  const [format, setFormat] = useState<StreamFormat>('csv');
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState('Idle');
   const [lastPost, setLastPost] = useState('Not connected');
@@ -361,8 +422,12 @@ export default function App() {
   const postingRef = useRef(false);
   const serverRef = useRef(server);
   const formatRef = useRef(format);
+  const tabRef = useRef(tab);
   const rateRef = useRef(DEFAULT_RATE_HZ);
-  const lastUiUpdateRef = useRef(0);
+  const packetsSentRef = useRef(0);
+  const postErrorsRef = useRef(0);
+  const lastUiSensorUpdateRef = useRef(0);
+  const lastUiPostUpdateRef = useRef(0);
 
   useEffect(() => {
     serverRef.current = server;
@@ -371,6 +436,10 @@ export default function App() {
   useEffect(() => {
     formatRef.current = format;
   }, [format]);
+
+  useEffect(() => {
+    tabRef.current = tab;
+  }, [tab]);
 
   useEffect(() => {
     let mounted = true;
@@ -414,10 +483,7 @@ export default function App() {
     return Math.min(MAX_RATE_HZ, Math.max(1, parsed));
   }
 
-  function snapshot(nextSeq = seqRef.current) {
-    const sampleHz = parsedRateHz();
-    rateRef.current = sampleHz;
-
+  function snapshot(nextSeq = seqRef.current, sampleHz = rateRef.current) {
     return buildPayload(
       nextSeq,
       sampleHz,
@@ -469,34 +535,61 @@ export default function App() {
     }
 
     const endpoint = normalizeEndpoint(serverRef.current);
-    const next = snapshot(seqRef.current + 1);
-    seqRef.current = next.seq;
-
+    const selectedFormat = formatRef.current;
+    const activeTab = tabRef.current;
+    const nextSeq = seqRef.current + 1;
     const now = Date.now();
-    if (now - lastUiUpdateRef.current >= UI_UPDATE_MS) {
-      lastUiUpdateRef.current = now;
+    const shouldUpdatePayload =
+      activeTab === 'dashboard' || activeTab === 'orientation' || activeTab === 'settings' || activeTab === 'json';
+    const shouldUpdateUi = shouldUpdatePayload && now - lastUiSensorUpdateRef.current >= UI_UPDATE_MS;
+    const next =
+      selectedFormat === 'json' || shouldUpdateUi
+        ? snapshot(nextSeq)
+        : null;
+    const body =
+      selectedFormat === 'json'
+        ? JSON.stringify(next)
+        : next
+          ? toCsv(next)
+          : buildCsvPacket(motionRef.current, accelerometerRef.current, gyroscopeRef.current, magnetometerRef.current);
+
+    seqRef.current = nextSeq;
+
+    if (next && shouldUpdateUi) {
+      lastUiSensorUpdateRef.current = now;
       setPayload(next);
-      setHistory((current) => appendHistory(current, next));
+      if (activeTab === 'dashboard') {
+        setHistory((current) => appendHistory(current, next));
+      }
     }
 
     postingRef.current = true;
     try {
-      const selectedFormat = formatRef.current;
       const response = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': selectedFormat === 'json' ? 'application/json' : 'text/csv' },
-        body: selectedFormat === 'json' ? JSON.stringify(next) : toCsv(next),
+        body,
       });
 
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
       }
 
-      setPacketsSent((count) => count + 1);
-      setLastPost(`POST ok ${new Date().toLocaleTimeString()}`);
+      packetsSentRef.current += 1;
+      if (now - lastUiPostUpdateRef.current >= POST_STATUS_UPDATE_MS) {
+        lastUiPostUpdateRef.current = now;
+        setPacketsSent(packetsSentRef.current);
+        setPostErrors(postErrorsRef.current);
+        setLastPost(`POST ok ${new Date().toLocaleTimeString()}`);
+      }
     } catch (error) {
-      setPostErrors((count) => count + 1);
-      setLastPost(`POST failed: ${error instanceof Error ? error.message : String(error)}`);
+      postErrorsRef.current += 1;
+      if (now - lastUiPostUpdateRef.current >= POST_STATUS_UPDATE_MS) {
+        lastUiPostUpdateRef.current = now;
+        setPacketsSent(packetsSentRef.current);
+        setPostErrors(postErrorsRef.current);
+        setLastPost(`POST failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
     } finally {
       postingRef.current = false;
     }
@@ -538,6 +631,7 @@ export default function App() {
 
       const sampleHz = parsedRateHz();
       const intervalMs = Math.round(1000 / sampleHz);
+      const magnetometerIntervalMs = Math.max(250, intervalMs);
       rateRef.current = sampleHz;
       if (availability.deviceMotion) {
         DeviceMotion.setUpdateInterval(intervalMs);
@@ -549,7 +643,7 @@ export default function App() {
         Gyroscope.setUpdateInterval(intervalMs);
       }
       if (availability.magnetometer) {
-        Magnetometer.setUpdateInterval(intervalMs);
+        Magnetometer.setUpdateInterval(magnetometerIntervalMs);
       }
 
       clearSubscriptions();
@@ -560,12 +654,13 @@ export default function App() {
           motionRef.current = measurement;
         }));
       }
-      if (availability.accelerometer) {
+
+      if (!availability.deviceMotion && availability.accelerometer) {
         subscriptions.push(Accelerometer.addListener((measurement) => {
           accelerometerRef.current = measurement;
         }));
       }
-      if (availability.gyroscope) {
+      if (!availability.deviceMotion && availability.gyroscope) {
         subscriptions.push(Gyroscope.addListener((measurement) => {
           gyroscopeRef.current = measurement;
         }));
@@ -667,21 +762,18 @@ function DashboardScreen({ payload, history }: { payload: ImuPayload; history: R
 
       <SensorCard
         accent="#56c7ff"
-        history={history.accelerometer}
         title="Accelerometer"
         unit="m/s2"
         vector={payload.acceleration}
       />
       <SensorCard
         accent="#d0e357"
-        history={history.gyroscope}
         title="Gyroscope"
         unit="rad/s"
         vector={payload.gyroscope}
       />
       <SensorCard
         accent="#ff7f6f"
-        history={history.magnetometer}
         title="Magnetometer"
         unit="uT"
         vector={payload.magnetometer}
@@ -884,55 +976,30 @@ function JsonScreen({ payload }: { payload: ImuPayload }) {
 
 function SensorCard({
   accent,
-  history,
   title,
   unit,
   vector,
 }: {
   accent: string;
-  history: SamplePoint[];
   title: string;
   unit: string;
   vector: Vector3;
 }) {
-  const summary = stats(history);
+  const vectorMagnitude = magnitude(vector);
 
   return (
     <View style={[styles.panel, { borderColor: accent }]}>
       <Text style={[styles.metricTitle, { color: accent }]}>{title}</Text>
-      <MiniChart history={history} />
       <View style={styles.rowGrid}>
         <MetricValue label="X" value={vector.x} />
         <MetricValue label="Y" value={vector.y} />
         <MetricValue label="Z" value={vector.z} />
-        <MetricValue label="Mag" value={magnitude(vector)} />
+        <MetricValue label="Mag" value={vectorMagnitude} />
       </View>
       <View style={styles.statsRow}>
-        <Text style={styles.mutedText}>min {formatValue(summary.min, 3)} {unit}</Text>
-        <Text style={styles.mutedText}>mean {formatValue(summary.mean, 3)}</Text>
-        <Text style={styles.mutedText}>max {formatValue(summary.max, 3)}</Text>
+        <Text style={styles.mutedText}>Live {unit}</Text>
+        <Text style={styles.mutedText}>simplified view</Text>
       </View>
-    </View>
-  );
-}
-
-function MiniChart({ history }: { history: SamplePoint[] }) {
-  const values = history.flatMap((point) => [point.x, point.y, point.z]).filter((value): value is number => typeof value === 'number');
-  const maxAbs = Math.max(1, ...values.map((value) => Math.abs(value)));
-  const latest = history.slice(-36);
-
-  return (
-    <View style={styles.chart}>
-      {latest.map((point, index) => {
-        const sizeFor = (value: number | null) => Math.max(3, Math.min(70, (Math.abs(value ?? 0) / maxAbs) * 70));
-        return (
-          <View key={`${point.t}-${index}`} style={styles.chartColumn}>
-            <View style={[styles.chartBar, styles.axisX, { height: sizeFor(point.x) }]} />
-            <View style={[styles.chartBar, styles.axisY, { height: sizeFor(point.y) }]} />
-            <View style={[styles.chartBar, styles.axisZ, { height: sizeFor(point.z) }]} />
-          </View>
-        );
-      })}
     </View>
   );
 }

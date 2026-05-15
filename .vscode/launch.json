@@ -1,0 +1,49 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Expo: Start",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "npm run start",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Expo: Web",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "npm run web",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Server: IMU JSON",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "npm run server",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "PIO: Upload (blackpill_f411ce)",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "C:/Users/bront/.platformio/penv/Scripts/platformio.exe run -t upload --environment blackpill_f411ce",
+      "cwd": "${workspaceFolder}/BNO_IMU_PIO"
+    },
+    {
+      "name": "PIO: Monitor (blackpill_f411ce)",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "C:/Users/bront/.platformio/penv/Scripts/platformio.exe device monitor --environment blackpill_f411ce",
+      "cwd": "${workspaceFolder}/BNO_IMU_PIO"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Run App + Server",
+      "configurations": [
+        "Expo: Start",
+        "Server: IMU JSON"
+      ]
+    }
+  ]
+}
